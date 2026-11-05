@@ -292,7 +292,9 @@ function Countdown({ ms, total }: { ms: number; total: number }) {
     const run = Animated.timing(left, { toValue: 0, duration: ms, easing: Easing.linear, useNativeDriver: true });
     run.start();
     return () => run.stop();
-  }, [left, ms]);
+    // One run per mount; polls bring a slightly newer `ms` that must not restart the bar.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [left]);
   return <Animated.View style={[styles.turnFill, { transform: [{ scaleX: left }] }]} />;
 }
 

@@ -4,7 +4,6 @@ import * as SecureStore from 'expo-secure-store';
 // In development the API runs on the same machine as Metro, so a phone can reach it on the LAN.
 const devHost = Constants.expoConfig?.hostUri?.split(':')[0] ?? 'localhost';
 export const API_URL = process.env.EXPO_PUBLIC_API_URL ?? `http://${devHost}:8000`;
-export const WS_URL = API_URL.replace(/^http/, 'ws');
 
 export type Profile = { id: string; token: string; name: string };
 export type RecentTeam = { teamId: string; code: string };
@@ -50,7 +49,14 @@ export type TableView = {
   hand: HandView | null;
 };
 
-export class AuthError extends Error {}
+export class ApiError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
+}
+export class AuthError extends ApiError {}
+
+export type TableResponse = { view?: TableView; version: number; error: string; left?: boolean };
 
 async function request(path: string, method: string, token?: string, body?: object) {
   let res: Response;
@@ -67,8 +73,8 @@ async function request(path: string, method: string, token?: string, body?: obje
     throw new Error("Can't reach the server. Check your connection.");
   }
   const data = await res.json().catch(() => ({}));
-  if (res.status === 401) throw new AuthError('Your profile was not found. Please set it up again.');
-  if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'That did not work.');
+  if (res.status === 401) throw new AuthError(401, 'Your profile was not found. Please set it up again.');
+  if (!res.ok) throw new ApiError(res.status, typeof data.detail === 'string' ? data.detail : 'That did not work.');
   return data;
 }
 
@@ -78,6 +84,10 @@ export const deleteGuest = (token: string) => request('/me', 'DELETE', token);
 export const createTeam = (token: string): Promise<RecentTeam> => request('/teams', 'POST', token);
 export const joinTeam = (token: string, code: string): Promise<RecentTeam> =>
   request('/teams/join', 'POST', token, { code });
+export const pollTable = (token: string, teamId: string): Promise<TableResponse> =>
+  request(`/teams/${teamId}`, 'GET', token);
+export const sendAction = (token: string, teamId: string, msg: object): Promise<TableResponse> =>
+  request(`/teams/${teamId}/actions`, 'POST', token, msg);
 
 const PROFILE_KEY = 'profile';
 const RECENT_KEY = 'recentTeams';

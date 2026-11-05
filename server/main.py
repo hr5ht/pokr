@@ -1,28 +1,27 @@
-"""Game server: guest profiles, team codes and the live table.
+"""Game API: guest profiles, team codes and the table, as plain HTTPS requests.
 
-Run: .venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+The server keeps nothing in memory, so any serverless instance can answer any
+request. Phones poll GET /teams/{id}, and turn timers and dealing advance inside
+those requests, so there is no background process.
+
+Local run: DATABASE_URL=... .venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 """
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
-import logging
 import os
 import secrets
-import sqlite3
 import time
 import uuid
-from collections import defaultdict, deque
-from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Callable, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, ValidationError, constr
+import psycopg
+from fastapi import FastAPI, Header, HTTPException, Request
+from psycopg.rows import dict_row
+from pydantic import BaseModel, constr
 
 from engine import DECK, Hand, IllegalAction
-
-log = logging.getLogger("poker")
 
 CODE_LENGTH = 4
 MAX_SEATS = 12
@@ -31,55 +30,88 @@ DEFAULT_SETTINGS = {"bb": 10, "stack": 1000, "timer": 30}
 FOLD_PAUSE_SECS = 3  # time to read the result before the next hand
 SHOWDOWN_PAUSE_SECS = 7
 TIMEOUTS_BEFORE_SIT_OUT = 2
+OFFLINE_AFTER_SECS = 8  # no poll for this long means the phone is gone
+SEEN_WRITE_SECS = 3  # how often a poll records that a player is still here
 SEAT_HELD_SECS = 30 * 60
 HOST_ABSENT_SECS = 10 * 60
-TEAM_EXPIRES_SECS = 90 * 24 * 3600
+TEAM_EXPIRES_SECS = 4 * 3600  # no phone open and no moves for this long
+MAX_MOVES_PER_REQUEST = 24  # auto-folds one request may catch up on
 
-# One connection, used only from the event loop: every route must be `async def`, because
-# FastAPI runs plain `def` routes on worker threads and sharing this across threads corrupts it.
-db = sqlite3.connect(os.environ.get("POKER_DB", "poker.db"), isolation_level=None, check_same_thread=False)
-db.row_factory = sqlite3.Row
-db.executescript("""
-    PRAGMA journal_mode=WAL;
-    PRAGMA synchronous=NORMAL;
-    CREATE TABLE IF NOT EXISTS guests(id TEXT PRIMARY KEY, token_hash TEXT UNIQUE, name TEXT);
-    CREATE TABLE IF NOT EXISTS teams(id TEXT PRIMARY KEY, code TEXT UNIQUE, data TEXT);
-""")
-
-teams: dict[str, dict] = {}
-conns: dict[str, dict[str, WebSocket]] = defaultdict(dict)  # team id -> guest id -> socket
+conn: Optional[psycopg.Connection] = None
 
 
-# --- persistence -------------------------------------------------------------
+def connection() -> psycopg.Connection:
+    """One connection per instance. Neon's pooled URL needs prepared statements off."""
+    global conn
+    if conn is None or conn.closed:
+        conn = psycopg.connect(
+            os.environ["DATABASE_URL"],
+            autocommit=True,
+            row_factory=dict_row,
+            connect_timeout=10,
+            prepare_threshold=None,
+        )
+        conn.execute("CREATE TABLE IF NOT EXISTS guests(id TEXT PRIMARY KEY, token_hash TEXT UNIQUE, name TEXT)")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS teams"
+            "(id TEXT PRIMARY KEY, code TEXT UNIQUE, data TEXT, updated_at DOUBLE PRECISION)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS hits(key TEXT, minute BIGINT, count INT, PRIMARY KEY (key, minute))"
+        )
+    return conn
 
-def save(team: dict) -> None:
-    """Runs after every change, so a restart resumes mid-hand."""
-    team["lastActive"] = time.time()
-    db.execute("INSERT OR REPLACE INTO teams VALUES (?, ?, ?)", (team["id"], team["code"], json.dumps(team, default=vars)))
+
+def query(sql: str, args: tuple = ()):
+    """Neon closes idle connections, so a dropped one gets a single retry."""
+    global conn
+    try:
+        return connection().execute(sql, args)
+    except psycopg.OperationalError:
+        conn = None
+        return connection().execute(sql, args)
 
 
-def load_teams() -> None:
-    teams.clear()
-    now = time.time()
-    for row in db.execute("SELECT data FROM teams"):
-        team = json.loads(row["data"])
-        if team["hand"]:
-            team["hand"] = Hand.from_json(team["hand"])
-        for m in team["members"]:
-            m["offlineSince"] = m["offlineSince"] or now  # nobody is connected yet
-        if team["deadline"]:
-            team["deadline"] = now + team["settings"]["timer"]  # give everyone time to reconnect
-        teams[team["id"]] = team
+def encode(team: dict) -> str:
+    return json.dumps(team, default=vars)
+
+
+def with_team(team_id: str, change: Callable[[dict], dict]) -> dict:
+    """Runs `change` holding the team's row lock, so two instances can't overwrite
+    each other. The row is written back only if something actually changed."""
+    global conn
+    for attempt in (1, 2):
+        try:
+            db = connection()
+            with db.transaction():
+                row = db.execute(
+                    "SELECT data FROM teams WHERE id = %s AND updated_at >= %s FOR UPDATE",
+                    (team_id, time.time() - TEAM_EXPIRES_SECS),
+                ).fetchone()
+                if not row:
+                    raise HTTPException(404, "That table no longer exists")
+                team = json.loads(row["data"])
+                if team["hand"]:
+                    team["hand"] = Hand.from_json(team["hand"])
+                result = change(team)
+                if all(m["gone"] for m in team["members"]):  # everyone has left, so free the code now
+                    db.execute("DELETE FROM teams WHERE id = %s", (team_id,))
+                elif encode(team) != row["data"]:
+                    team["version"] += 1
+                    result["version"] = team["version"]
+                    db.execute(
+                        "UPDATE teams SET code = %s, data = %s, updated_at = %s WHERE id = %s",
+                        (team["code"], encode(team), time.time(), team_id),
+                    )
+                return result
+        except psycopg.OperationalError:
+            conn = None
+            if attempt == 2:
+                raise
 
 
 def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
-
-
-def guest_for_token(token: object) -> Optional[sqlite3.Row]:
-    if not isinstance(token, str):
-        return None
-    return db.execute("SELECT * FROM guests WHERE token_hash = ?", (hash_token(token),)).fetchone()
 
 
 # --- table -------------------------------------------------------------------
@@ -88,22 +120,26 @@ def member(team: dict, gid: str) -> Optional[dict]:
     return next((m for m in team["members"] if m["id"] == gid), None)
 
 
+def is_online(m: dict, now: float) -> bool:
+    return now - m["seen"] < OFFLINE_AFTER_SECS
+
+
 def new_code() -> str:
-    # only 10,000 codes, so give up rather than spin; lengthen CODE_LENGTH if this fires.
+    # Only 10,000 codes, so give up rather than spin; raise CODE_LENGTH if this ever fires.
     for _ in range(200):
         code = "".join(secrets.choice("0123456789") for _ in range(CODE_LENGTH))
-        if not db.execute("SELECT 1 FROM teams WHERE code = ?", (code,)).fetchone():
+        if not query("SELECT 1 FROM teams WHERE code = %s", (code,)).fetchone():
             return code
     raise IllegalAction("no free team codes right now")
 
 
-def add_member(team: dict, guest: sqlite3.Row) -> None:
+def add_member(team: dict, guest: dict) -> None:
     taken = {m["seat"] for m in team["members"]}
     team["members"].append({
         "id": guest["id"], "name": guest["name"],
         "seat": min(set(range(MAX_SEATS)) - taken),
         "stack": team["settings"]["stack"],
-        "sittingOut": False, "timeouts": 0, "gone": False, "offlineSince": time.time(),
+        "sittingOut": False, "timeouts": 0, "gone": False, "seen": time.time(),
     })
 
 
@@ -113,7 +149,7 @@ def live_hand(team: dict) -> Optional[Hand]:
 
 
 def remove_member(team: dict, gid: str) -> None:
-    """A player in a live hand stays until it ends; the ticker folds them on their turn."""
+    """A player in a live hand stays until it ends; advance() folds them on their turn."""
     m = member(team, gid)
     if not m:
         return
@@ -124,9 +160,9 @@ def remove_member(team: dict, gid: str) -> None:
         team["members"].remove(m)
 
 
-def deal(team: dict) -> bool:
+def deal(team: dict, now: float) -> bool:
     ready = sorted(
-        (m for m in team["members"] if m["stack"] > 0 and not m["sittingOut"] and not m["offlineSince"]),
+        (m for m in team["members"] if m["stack"] > 0 and not m["sittingOut"] and is_online(m, now)),
         key=lambda m: m["seat"],
     )
     if len(ready) < 2:
@@ -154,6 +190,45 @@ def after_action(team: dict) -> None:
     team["members"] = [m for m in team["members"] if not m["gone"]]
     team["deadline"] = 0
     team["nextHandAt"] = time.time() + (SHOWDOWN_PAUSE_SECS if h.result["shown"] else FOLD_PAUSE_SECS)
+
+
+def ensure_host(team: dict, now: float) -> None:
+    """With no accounts a host can vanish for good, so someone present takes over."""
+    host = member(team, team["host"])
+    if not host or now - host["seen"] > HOST_ABSENT_SECS:
+        heir = next((m for m in sorted(team["members"], key=lambda m: m["seat"]) if is_online(m, now)), None)
+        if heir:
+            team["host"] = heir["id"]
+
+
+def advance(team: dict, now: float) -> None:
+    """Everything a background loop would do, run on demand. Time only has to move
+    while someone is polling, and an empty table has nothing to do."""
+    ensure_host(team, now)
+    for m in list(team["members"]):
+        if now - m["seen"] > SEAT_HELD_SECS:
+            remove_member(team, m["id"])
+
+    for _ in range(MAX_MOVES_PER_REQUEST):
+        if team["paused"]:
+            return
+        h = live_hand(team)
+        if h:
+            p = h.players[h.to_act]
+            m = member(team, p["id"])
+            away = not m or m["sittingOut"] or m["gone"]
+            if not away and now < team["deadline"]:
+                return
+            if not away:
+                m["timeouts"] += 1
+                m["sittingOut"] = m["timeouts"] >= TIMEOUTS_BEFORE_SIT_OUT
+            h.act(p["id"], "fold" if h.legal()["call"] else "check")
+            after_action(team)
+        elif team["running"] and now >= team["nextHandAt"]:
+            if not deal(team, now):
+                return
+        else:
+            return
 
 
 def handle_host(team: dict, msg: "Msg") -> None:
@@ -194,8 +269,6 @@ def handle_host(team: dict, msg: "Msg") -> None:
 
 def handle(team: dict, gid: str, msg: "Msg") -> None:
     m = member(team, gid)
-    if not m:
-        raise IllegalAction("not at this table")
     if msg.t == "act":
         h = live_hand(team)
         if not h or team["paused"] or msg.seq != h.seq:
@@ -221,21 +294,20 @@ def handle(team: dict, gid: str, msg: "Msg") -> None:
         raise IllegalAction("unknown message")
 
 
-def view_for(team: dict, gid: str) -> dict:
+def view_for(team: dict, gid: str, now: float) -> dict:
     """Everything a player may see. All outgoing state goes through here, so this
     is the one place that keeps the deck and other players' cards off the wire."""
     h = team["hand"]
     live = live_hand(team)
     in_hand = {p["id"]: p for p in h.players} if h else {}
     shown = set(h.result["shown"]) if h and h.result else set()
-    online = conns[team["id"]]
 
     seats = []
     for m in sorted(team["members"], key=lambda m: m["seat"]):
         p = in_hand.get(m["id"])
         seats.append({
             "id": m["id"], "name": m["name"],
-            "online": m["id"] in online,
+            "online": is_online(m, now),
             "sittingOut": m["sittingOut"],
             "stack": p["stack"] if p and live else m["stack"],
             "inHand": bool(p),
@@ -249,16 +321,15 @@ def view_for(team: dict, gid: str) -> dict:
     hand = None
     if h:
         turn = h.players[h.to_act]["id"] if h.to_act is not None else None
-        mine = gid in in_hand
         hand = {
             "board": h.board,
             "pot": h.result["pot"] if h.result else h.pot,
             "seq": h.seq,
             "toAct": turn,
-            "turnMs": int(max(team["deadline"] - time.time(), 0) * 1000) if turn else 0,
+            "turnMs": int(max(team["deadline"] - now, 0) * 1000) if turn else 0,
             "current": h.current,
             "legal": h.legal() if turn == gid else None,
-            "handName": h.current_name(gid) if mine else None,
+            "handName": h.current_name(gid) if gid in in_hand else None,
             "result": h.result,
         }
 
@@ -269,104 +340,26 @@ def view_for(team: dict, gid: str) -> dict:
     }
 
 
-async def push(team: dict) -> None:
-    save(team)
-    sockets = conns[team["id"]]
-    for gid, sock in list(sockets.items()):
-        m = member(team, gid)
-        try:
-            if not m or m["gone"]:
-                del sockets[gid]
-                await sock.close(code=4003)
-            else:
-                await asyncio.wait_for(sock.send_json({"t": "view", "view": view_for(team, gid)}), 5)
-        except Exception:
-            sockets.pop(gid, None)
-
-
-def ensure_host(team: dict, now: float) -> bool:
-    """With no accounts a host can vanish for good, so someone present takes over."""
-    host = member(team, team["host"])
-    absent = not host or (host["offlineSince"] and now - host["offlineSince"] > HOST_ABSENT_SECS)
-    heir = next((m for m in sorted(team["members"], key=lambda m: m["seat"]) if not m["offlineSince"]), None)
-    if absent and heir:
-        team["host"] = heir["id"]
-        return True
-    return False
-
-
-async def tick(team: dict) -> None:
-    now = time.time()
-    changed = ensure_host(team, now)
-
-    for m in list(team["members"]):
-        if m["offlineSince"] and now - m["offlineSince"] > SEAT_HELD_SECS:
-            remove_member(team, m["id"])
-            changed = True
-
-    h = live_hand(team)
-    if h and not team["paused"]:
-        p = h.players[h.to_act]
-        m = member(team, p["id"])
-        away = not m or m["sittingOut"] or m["gone"]
-        if away or now >= team["deadline"]:
-            if not away:
-                m["timeouts"] += 1
-                m["sittingOut"] = m["timeouts"] >= TIMEOUTS_BEFORE_SIT_OUT
-            h.act(p["id"], "fold" if h.legal()["call"] else "check")
-            after_action(team)
-            changed = True
-    elif not h and team["running"] and not team["paused"] and now >= team["nextHandAt"]:
-        changed = deal(team) or changed
-
-    if changed:
-        await push(team)
-
-
-async def ticker() -> None:
-    # scans every team twice a second; fine for thousands of teams on one box.
-    while True:
-        await asyncio.sleep(0.5)
-        now = time.time()
-        for team in list(teams.values()):
-            try:
-                if not conns[team["id"]] and now - team["lastActive"] > TEAM_EXPIRES_SECS:
-                    del teams[team["id"]]
-                    db.execute("DELETE FROM teams WHERE id = ?", (team["id"],))
-                else:
-                    await tick(team)
-            except Exception:
-                log.exception("tick failed for team %s", team["id"])
-
-
 # --- HTTP --------------------------------------------------------------------
 
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    load_teams()
-    task = asyncio.create_task(ticker())
-    yield
-    task.cancel()
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 
-app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
-
-recent_hits: dict[str, deque] = defaultdict(deque)
-
-
-def rate_limit(request: Request, limit: int = 20, window: int = 60) -> None:
-    # per-process and per-IP. Behind a proxy, run uvicorn with --proxy-headers.
-    now = time.time()
-    hits = recent_hits[f"{request.client.host}:{request.url.path}"]
-    while hits and now - hits[0] > window:
-        hits.popleft()
-    if len(hits) >= limit:
+def rate_limit(request: Request, limit: int = 20) -> None:
+    """Kept in Postgres because serverless instances share no memory."""
+    ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.client.host
+    count = query(
+        "INSERT INTO hits VALUES (%s, %s, 1) "
+        "ON CONFLICT (key, minute) DO UPDATE SET count = hits.count + 1 RETURNING count",
+        (f"{ip}:{request.url.path}", int(time.time() // 60)),
+    ).fetchone()["count"]
+    if count > limit:
         raise HTTPException(429, "Too many attempts. Try again in a minute.")
-    hits.append(now)
 
 
-def current_guest(authorization: Optional[str]) -> sqlite3.Row:
-    guest = guest_for_token((authorization or "").replace("Bearer ", "", 1))
+def current_guest(authorization: Optional[str]) -> dict:
+    token = (authorization or "").replace("Bearer ", "", 1)
+    guest = query("SELECT * FROM guests WHERE token_hash = %s", (hash_token(token),)).fetchone() if token else None
     if not guest:
         raise HTTPException(401, "Unknown guest")
     return guest
@@ -393,6 +386,17 @@ class Msg(BaseModel):
     settings: Optional[dict] = None
 
 
+def seated(team: dict, gid: str) -> dict:
+    m = member(team, gid)
+    if not m or m["gone"]:
+        raise HTTPException(403, "You're not at this table")
+    return m
+
+
+def table_response(team: dict, gid: str, now: float, error: str = "") -> dict:
+    return {"view": view_for(team, gid, now), "version": team["version"], "error": error}
+
+
 @app.get("/health")
 async def health():
     return {"ok": True}
@@ -402,115 +406,110 @@ async def health():
 async def create_guest(profile: Profile, request: Request):
     rate_limit(request)
     gid, token = str(uuid.uuid4()), secrets.token_urlsafe(32)
-    db.execute("INSERT INTO guests(id, token_hash, name) VALUES (?, ?, ?)", (gid, hash_token(token), profile.name))
+    query("INSERT INTO guests VALUES (%s, %s, %s)", (gid, hash_token(token), profile.name))
     return {"id": gid, "token": token}
 
 
 @app.put("/me")
 async def update_me(profile: Profile, authorization: Optional[str] = Header(None)):
     guest = current_guest(authorization)
-    db.execute("UPDATE guests SET name = ? WHERE id = ?", (profile.name, guest["id"]))
-    for team in teams.values():
-        m = member(team, guest["id"])
-        if m:
-            m["name"] = profile.name
-            await push(team)
-    return {"ok": True}
+    query("UPDATE guests SET name = %s WHERE id = %s", (profile.name, guest["id"]))
+    return {"ok": True}  # tables pick up the new name on the player's next poll
 
 
 @app.delete("/me")
 async def delete_me(authorization: Optional[str] = Header(None)):
     guest = current_guest(authorization)
-    for team in teams.values():
-        if member(team, guest["id"]):
-            remove_member(team, guest["id"])
-            await push(team)
-    db.execute("DELETE FROM guests WHERE id = ?", (guest["id"],))
-    return {"ok": True}
+    query("DELETE FROM guests WHERE id = %s", (guest["id"],))
+    return {"ok": True}  # with no more polls, their seat is released after SEAT_HELD_SECS
+
+
+def sweep() -> None:
+    """Nothing runs in the background, so the requests that need a free code clean up."""
+    query("DELETE FROM teams WHERE updated_at < %s", (time.time() - TEAM_EXPIRES_SECS,))
+    query("DELETE FROM hits WHERE minute < %s", (int(time.time() // 60) - 10,))
 
 
 @app.post("/teams")
 async def create_team(request: Request, authorization: Optional[str] = Header(None)):
     rate_limit(request)
     guest = current_guest(authorization)
+    sweep()
     try:
         code = new_code()
     except IllegalAction as e:
         raise HTTPException(503, str(e))
     team = {
-        "id": str(uuid.uuid4()), "code": code, "host": guest["id"],
+        "id": str(uuid.uuid4()), "code": code, "host": guest["id"], "version": 1,
         "settings": dict(DEFAULT_SETTINGS), "members": [], "banned": [],
         "running": False, "paused": False, "hand": None,
-        "deadline": 0, "nextHandAt": 0, "buttonSeat": -1, "lastActive": time.time(),
+        "deadline": 0, "nextHandAt": 0, "buttonSeat": -1,
     }
     add_member(team, guest)
-    teams[team["id"]] = team
-    save(team)
-    return {"teamId": team["id"], "code": team["code"]}
+    query("INSERT INTO teams VALUES (%s, %s, %s, %s)", (team["id"], code, encode(team), time.time()))
+    return {"teamId": team["id"], "code": code}
 
 
 @app.post("/teams/join")
 async def join_team(body: Join, request: Request, authorization: Optional[str] = Header(None)):
     rate_limit(request)
     guest = current_guest(authorization)
-    row = db.execute("SELECT id FROM teams WHERE code = ?", (body.code,)).fetchone()
-    team = teams.get(row["id"]) if row else None
-    if not team:
+    sweep()
+    row = query("SELECT id FROM teams WHERE code = %s", (body.code,)).fetchone()
+    if not row:
         raise HTTPException(404, "No team with that code")
-    if guest["id"] in team["banned"]:
-        raise HTTPException(403, "The host removed you from this team")
-    existing = member(team, guest["id"])
-    if existing:
-        existing["gone"] = False
-    else:
-        if len(team["members"]) >= MAX_SEATS:
-            raise HTTPException(409, "This table is full")
-        add_member(team, guest)
-    await push(team)
-    return {"teamId": team["id"], "code": team["code"]}
+
+    def change(team: dict) -> dict:
+        if guest["id"] in team["banned"]:
+            raise HTTPException(403, "The host removed you from this team")
+        existing = member(team, guest["id"])
+        if existing:
+            existing.update(gone=False, seen=time.time())
+        else:
+            if len(team["members"]) >= MAX_SEATS:
+                raise HTTPException(409, "This table is full")
+            add_member(team, guest)
+        return {"teamId": team["id"], "code": team["code"]}
+
+    return with_team(row["id"], change)
 
 
-# --- live table --------------------------------------------------------------
+@app.get("/teams/{team_id}")
+async def poll_table(team_id: str, authorization: Optional[str] = Header(None)):
+    """Phones call this about once a second."""
+    guest = current_guest(authorization)
 
-@app.websocket("/ws/{team_id}")
-async def table_socket(sock: WebSocket, team_id: str):
-    """The first message must be {token}; the token stays out of URLs and access logs."""
-    await sock.accept()
-    try:
-        hello = await asyncio.wait_for(sock.receive_json(), 10)
-        guest = guest_for_token(hello.get("token"))
-    except Exception:
-        await sock.close(code=4001)
-        return
+    def change(team: dict) -> dict:
+        now = time.time()
+        m = seated(team, guest["id"])
+        m["name"] = guest["name"]
+        if now - m["seen"] > SEEN_WRITE_SECS:
+            m["seen"] = now
+        advance(team, now)
+        seated(team, guest["id"])
+        return table_response(team, guest["id"], now)
 
-    team = teams.get(team_id)
-    if not guest or not team or not member(team, guest["id"]):
-        await sock.close(code=4003)
-        return
+    return with_team(team_id, change)
 
-    gid = guest["id"]
-    previous = conns[team_id].get(gid)
-    if previous:
-        await previous.close(code=4000)
-    conns[team_id][gid] = sock
-    member(team, gid)["offlineSince"] = None
-    await push(team)
 
-    try:
-        while True:
-            try:
-                raw = await sock.receive_json()
-                handle(team, gid, Msg(**raw))
-            except (IllegalAction, ValidationError, TypeError, ValueError) as e:
-                await sock.send_json({"t": "error", "msg": str(e)[:100]})
-                continue
-            await push(team)
-    except (WebSocketDisconnect, RuntimeError):
-        pass
-    finally:
-        if conns[team_id].get(gid) in (sock, None):
-            conns[team_id].pop(gid, None)
-            m = member(team, gid)
-            if m:
-                m["offlineSince"] = time.time()
-                await push(team)
+@app.post("/teams/{team_id}/actions")
+async def send_action(team_id: str, msg: Msg, authorization: Optional[str] = Header(None)):
+    guest = current_guest(authorization)
+
+    def change(team: dict) -> dict:
+        now = time.time()
+        seated(team, guest["id"])["seen"] = now
+        advance(team, now)
+        error = ""
+        try:
+            seated(team, guest["id"])
+            handle(team, guest["id"], msg)
+            advance(team, now)
+        except IllegalAction as e:
+            error = str(e)[:100]
+        m = member(team, guest["id"])
+        if not m or m["gone"]:
+            return {"left": True, "version": team["version"], "error": ""}
+        return table_response(team, guest["id"], now, error)
+
+    return with_team(team_id, change)

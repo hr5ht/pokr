@@ -1,80 +1,83 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 
-import { TableView, WS_URL } from './api';
+import { ApiError, AuthError, pollTable, sendAction, TableResponse, TableView } from './api';
 
-const NOT_A_MEMBER = new Set([4001, 4003]);
+const POLL_MS = 800;
+const FAILURES_BEFORE_WARNING = 3;
+const ERROR_SHOWN_MS = 3000;
 
-/** The server always sends the full table, so reconnecting needs no special handling. */
+/** Asks the server for the table about once a second while the app is open.
+ *  Every answer is the whole table, so a missed one fixes itself on the next. */
 export function useTable(teamId: string, token: string | undefined) {
   const [view, setView] = useState<TableView | null>(null);
-  const [connected, setConnected] = useState(false);
+  const [connected, setConnected] = useState(true);
   const [removed, setRemoved] = useState(false);
   const [error, setError] = useState('');
-  const sock = useRef<WebSocket | null>(null);
+  const version = useRef(0);
+
+  // A poll and a move can pass each other on the network, so never go backwards.
+  const apply = useCallback((res: TableResponse) => {
+    if (res.view && res.version >= version.current) {
+      version.current = res.version;
+      setView(res.view);
+    }
+  }, []);
 
   useEffect(() => {
     if (!token) return;
     let stopped = false;
-    let attempts = 0;
-    let retry: ReturnType<typeof setTimeout>;
+    let failures = 0;
+    let timer: ReturnType<typeof setTimeout>;
 
-    const connect = () => {
-      if (stopped) return;
-      const ws = new WebSocket(`${WS_URL}/ws/${teamId}`);
-      sock.current = ws;
-      ws.onopen = () => {
-        if (sock.current !== ws) {
-          ws.close(); // a newer socket took over while this one was still opening
-          return;
+    const poll = async () => {
+      if (AppState.currentState === 'active') {
+        try {
+          const res = await pollTable(token, teamId);
+          if (stopped) return;
+          apply(res);
+          failures = 0;
+          setConnected(true);
+        } catch (e) {
+          if (stopped) return;
+          const gone = e instanceof AuthError || (e instanceof ApiError && [403, 404].includes(e.status));
+          if (gone) {
+            setRemoved(true);
+            return;
+          }
+          failures += 1;
+          if (failures >= FAILURES_BEFORE_WARNING) setConnected(false);
         }
-        attempts = 0;
-        ws.send(JSON.stringify({ token }));
-        setConnected(true);
-      };
-      ws.onmessage = (event) => {
-        if (sock.current !== ws) return;
-        const msg = JSON.parse(event.data);
-        if (msg.t === 'view') {
-          setView(msg.view);
-          setError('');
-        } else if (msg.t === 'error') {
-          setError(msg.msg);
-        }
-      };
-      ws.onclose = (event) => {
-        if (sock.current !== ws) return;
-        setConnected(false);
-        if (NOT_A_MEMBER.has(event.code)) setRemoved(true);
-        else retry = setTimeout(connect, Math.min(500 * 2 ** attempts++, 8000));
-      };
+      }
+      timer = setTimeout(poll, POLL_MS);
     };
 
-    connect();
-    // Phones kill sockets in the background, so don't wait for the backoff on return.
-    const sub = AppState.addEventListener('change', (state) => {
-      const socketState = sock.current?.readyState;
-      if (state === 'active' && socketState !== WebSocket.OPEN && socketState !== WebSocket.CONNECTING) {
-        clearTimeout(retry);
-        const old = sock.current;
-        connect();
-        old?.close();
-      }
-    });
-
+    poll();
     return () => {
       stopped = true;
-      clearTimeout(retry);
-      sub.remove();
-      const ws = sock.current;
-      sock.current = null;
-      ws?.close();
+      clearTimeout(timer);
     };
-  }, [teamId, token]);
+  }, [teamId, token, apply]);
 
-  const send = useCallback((msg: object) => {
-    if (sock.current?.readyState === WebSocket.OPEN) sock.current.send(JSON.stringify(msg));
-  }, []);
+  useEffect(() => {
+    if (!error) return;
+    const timer = setTimeout(() => setError(''), ERROR_SHOWN_MS);
+    return () => clearTimeout(timer);
+  }, [error]);
+
+  const send = useCallback(
+    async (msg: object) => {
+      if (!token) return;
+      try {
+        const res = await sendAction(token, teamId, msg);
+        apply(res);
+        setError(res.error);
+      } catch {
+        setError("Couldn't reach the server. Try again.");
+      }
+    },
+    [teamId, token, apply],
+  );
 
   return { view, connected, removed, error, send };
 }
