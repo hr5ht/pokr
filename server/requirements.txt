@@ -1,3 +1,2 @@
 fastapi
 uvicorn[standard]
-httpx  # bot.py and tests only

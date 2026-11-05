@@ -5,6 +5,10 @@ CLAUDE.md
 plan.md
 design/
 
+# Local dev tools
+server/bot.py
+server/test_*.py
+
 # Template leftovers
 app/LICENSE
 
