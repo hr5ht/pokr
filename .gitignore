@@ -1,0 +1,12 @@
+# Local notes and tooling
+.claude/
+AGENTS.md
+CLAUDE.md
+plan.md
+design/
+
+# Template leftovers
+app/LICENSE
+
+# OS
+.DS_Store
