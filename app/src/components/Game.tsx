@@ -29,6 +29,7 @@ const RAIL_ITEM = 92;
 const BAR_HEIGHT = 66;
 const FOLD_PAUSE_MS = 3000; // matches the server's pause between hands
 const SHOWDOWN_PAUSE_MS = 7000;
+const SENT_LOCK_MS = 3000;
 
 export function Game({ view, send, connected, error, onShare, onLeave }: TableProps) {
   const insets = useSafeAreaInsets();
@@ -292,7 +293,7 @@ function Countdown({ ms, total }: { ms: number; total: number }) {
     const run = Animated.timing(left, { toValue: 0, duration: ms, easing: Easing.linear, useNativeDriver: true });
     run.start();
     return () => run.stop();
-    // One run per mount; polls bring a slightly newer `ms` that must not restart the bar.
+    // One run per mount; later updates bring a slightly newer `ms` that must not restart the bar.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [left]);
   return <Animated.View style={[styles.turnFill, { transform: [{ scaleX: left }] }]} />;
@@ -315,6 +316,12 @@ function Actions({
 }) {
   const legal = hand.legal!;
   const [raising, setRaising] = useState(false);
+  const [sent, setSent] = useState(false); // this component is replaced once the move lands
+  useEffect(() => {
+    if (!sent) return;
+    const timer = setTimeout(() => setSent(false), SENT_LOCK_MS); // a move that got lost can be tried again
+    return () => clearTimeout(timer);
+  }, [sent]);
   const min = legal.raiseMin ?? 0;
   const max = legal.raiseMax ?? 0;
   const [amount, setAmount] = useState(min);
@@ -327,7 +334,10 @@ function Actions({
   };
   // Drag in big-blind steps, but always let the far end reach all-in.
   const snap = (n: number) => (n >= max ? max : clamp(min + Math.round((n - min) / bb) * bb));
-  const act =(action: string, value?: number) => send({ t: 'act', seq: hand.seq, action, amount: value });
+  const act = (action: string, value?: number) => () => {
+    setSent(true);
+    send({ t: 'act', seq: hand.seq, action, amount: value });
+  };
   const potAfterCall = hand.pot + legal.call;
   const word = hand.current ? 'Raise' : 'Bet';
 
@@ -371,26 +381,26 @@ function Actions({
               wide
               pad={pad}
               label={amount === max ? `All in ${amount}` : `${word} to ${amount}`}
-              onPress={() => act('raise', amount)}
+              onPress={sent ? undefined : act('raise', amount)}
             />
           </>
         ) : (
           <>
-            <BarButton pad={pad} label="Fold" onPress={() => act('fold')} />
+            <BarButton pad={pad} label="Fold" onPress={sent ? undefined : act('fold')} />
             {legal.call ? (
               <BarButton
                 pad={pad}
                 label={legal.call === me.stack ? `All in ${legal.call}` : `Call ${legal.call}`}
-                onPress={() => act('call')}
+                onPress={sent ? undefined : act('call')}
               />
             ) : (
-              <BarButton pad={pad} label="Check" onPress={() => act('check')} />
+              <BarButton pad={pad} label="Check" onPress={sent ? undefined : act('check')} />
             )}
             <BarButton
               main={legal.raiseMin !== null}
               pad={pad}
               label={word}
-              onPress={legal.raiseMin !== null ? () => setRaising(true) : undefined}
+              onPress={legal.raiseMin !== null && !sent ? () => setRaising(true) : undefined}
             />
           </>
         )}

@@ -16,9 +16,11 @@ Download the Android app from [Releases](../../releases/latest).
 
 The server decides everything, and each phone only receives the cards its player is allowed to see.
 
-There is no WebSocket connection. Phones poll the API over HTTPS about once a second, and all game state lives in Postgres, so any serverless instance can answer any request. Turn timers and dealing move forward inside those requests, and a row lock on each table stops two requests from overwriting each other.
+Profiles and team codes use HTTPS. The table itself runs over a WebSocket, so a move reaches the other phones as soon as the server has it.
 
-A table is deleted as soon as everyone has left, or after 4 hours with no activity. Its code is then free to use again.
+Vercel can run several instances and closes each socket after five minutes, so no game state lives in memory. Every table is a row in Postgres, a row lock stops two instances from overwriting each other, and `NOTIFY` tells every instance when a table changes. Each instance then sends the new table to the phones connected to it. The app swaps to a fresh socket before the five minutes are up and reconnects if replies stop arriving.
+
+A table is deleted as soon as everyone has left, or after 4 hours with no connected phones or moves. Its code is then free to use again.
 
 | Part | Stack |
 | --- | --- |
@@ -57,12 +59,7 @@ EXPO_PUBLIC_API_URL=https://your-server.example.com
 
 ## Deploy the server
 
-Deploy from `server/` with the Vercel CLI, after setting `DATABASE_URL` as an environment variable on the project:
-
-```sh
-cd server
-vercel deploy --prod
-```
+Connect the repo to a Vercel project, set its Root Directory to `server`, and add `DATABASE_URL` as an environment variable. Every push to `main` then deploys automatically. Sockets need Fluid compute, which new projects have by default.
 
 The region is set in `server/vercel.json`. The tables are created automatically on first use.
 

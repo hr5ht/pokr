@@ -4,6 +4,7 @@ import * as SecureStore from 'expo-secure-store';
 // In development the API runs on the same machine as Metro, so a phone can reach it on the LAN.
 const devHost = Constants.expoConfig?.hostUri?.split(':')[0] ?? 'localhost';
 export const API_URL = process.env.EXPO_PUBLIC_API_URL ?? `http://${devHost}:8000`;
+export const WS_URL = API_URL.replace(/^http/, 'ws');
 
 export type Profile = { id: string; token: string; name: string };
 export type RecentTeam = { teamId: string; code: string };
@@ -56,7 +57,7 @@ export class ApiError extends Error {
 }
 export class AuthError extends ApiError {}
 
-export type TableResponse = { view?: TableView; version: number; error: string; left?: boolean };
+export type TableResponse = { view: TableView; version: number; error: string };
 
 async function request(path: string, method: string, token?: string, body?: object) {
   let res: Response;
@@ -84,10 +85,6 @@ export const deleteGuest = (token: string) => request('/me', 'DELETE', token);
 export const createTeam = (token: string): Promise<RecentTeam> => request('/teams', 'POST', token);
 export const joinTeam = (token: string, code: string): Promise<RecentTeam> =>
   request('/teams/join', 'POST', token, { code });
-export const pollTable = (token: string, teamId: string): Promise<TableResponse> =>
-  request(`/teams/${teamId}`, 'GET', token);
-export const sendAction = (token: string, teamId: string, msg: object): Promise<TableResponse> =>
-  request(`/teams/${teamId}/actions`, 'POST', token, msg);
 
 const PROFILE_KEY = 'profile';
 const RECENT_KEY = 'recentTeams';

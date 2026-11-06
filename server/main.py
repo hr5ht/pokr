@@ -1,23 +1,26 @@
-"""Game API: guest profiles, team codes and the table, as plain HTTPS requests.
+"""Game API. Guest profiles and team codes are plain HTTPS; the table runs over a
+WebSocket at /ws/{team_id}.
 
-The server keeps nothing in memory, so any serverless instance can answer any
-request. Phones poll GET /teams/{id}, and turn timers and dealing advance inside
-those requests, so there is no background process.
+Vercel may run several instances and closes every socket after five minutes, so
+nothing that matters lives in memory. The table is in Postgres, NOTIFY tells every
+instance when it changes, and each instance sends the new view to its own sockets.
 
 Local run: DATABASE_URL=... .venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import secrets
+import threading
 import time
 import uuid
 from typing import Callable, Optional
 
 import psycopg
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from psycopg.rows import dict_row
 from pydantic import BaseModel, constr
 
@@ -30,45 +33,55 @@ DEFAULT_SETTINGS = {"bb": 10, "stack": 1000, "timer": 30}
 FOLD_PAUSE_SECS = 3  # time to read the result before the next hand
 SHOWDOWN_PAUSE_SECS = 7
 TIMEOUTS_BEFORE_SIT_OUT = 2
-OFFLINE_AFTER_SECS = 8  # no poll for this long means the phone is gone
-SEEN_WRITE_SECS = 3  # how often a poll records that a player is still here
+OFFLINE_AFTER_SECS = 13  # phones ping every 5 seconds
+SILENT_SOCKET_SECS = 15  # a socket with no ping for this long is dead, whatever TCP thinks
+HELLO_TIMEOUT_SECS = 10
+SEND_TIMEOUT_SECS = 3
+CLOCK_SECS = 0.25  # how often an instance looks for an expired turn timer
+RETRY_TIMER_SECS = 3  # a timer that moved nothing, like a deal with too few players
+MESSAGES_PER_MINUTE = 120
+FROZEN_TRANSACTION_MS = 3000  # Vercel can freeze an instance halfway through a transaction
+LOCK_WAIT_MS = 5000  # longer than the above, so a waiter outlasts a frozen lock holder
 SEAT_HELD_SECS = 30 * 60
 HOST_ABSENT_SECS = 10 * 60
 TEAM_EXPIRES_SECS = 4 * 3600  # no phone open and no moves for this long
-MAX_MOVES_PER_REQUEST = 24  # auto-folds one request may catch up on
+MAX_MOVES_PER_ADVANCE = 24  # auto-folds one call may catch up on
 
-conn: Optional[psycopg.Connection] = None
+local = threading.local()  # a transaction belongs to one connection, so threads can't share one
+tables_ready = False
 
 
 def connection() -> psycopg.Connection:
-    """One connection per instance. Neon's pooled URL needs prepared statements off."""
-    global conn
-    if conn is None or conn.closed:
-        conn = psycopg.connect(
+    """One connection per thread. Neon's pooled URL needs prepared statements off."""
+    global tables_ready
+    db = getattr(local, "conn", None)
+    if db is None or db.closed:
+        db = local.conn = psycopg.connect(
             os.environ["DATABASE_URL"],
             autocommit=True,
             row_factory=dict_row,
             connect_timeout=10,
             prepare_threshold=None,
         )
-        conn.execute("CREATE TABLE IF NOT EXISTS guests(id TEXT PRIMARY KEY, token_hash TEXT UNIQUE, name TEXT)")
-        conn.execute(
+    if not tables_ready:
+        db.execute("CREATE TABLE IF NOT EXISTS guests(id TEXT PRIMARY KEY, token_hash TEXT UNIQUE, name TEXT)")
+        db.execute(
             "CREATE TABLE IF NOT EXISTS teams"
             "(id TEXT PRIMARY KEY, code TEXT UNIQUE, data TEXT, updated_at DOUBLE PRECISION)"
         )
-        conn.execute(
+        db.execute(
             "CREATE TABLE IF NOT EXISTS hits(key TEXT, minute BIGINT, count INT, PRIMARY KEY (key, minute))"
         )
-    return conn
+        tables_ready = True
+    return db
 
 
 def query(sql: str, args: tuple = ()):
     """Neon closes idle connections, so a dropped one gets a single retry."""
-    global conn
     try:
         return connection().execute(sql, args)
     except psycopg.OperationalError:
-        conn = None
+        local.conn = None
         return connection().execute(sql, args)
 
 
@@ -76,14 +89,28 @@ def encode(team: dict) -> str:
     return json.dumps(team, default=vars)
 
 
+def public(team: dict, now: float) -> dict:
+    """The table without its heartbeat fields, which change constantly and show nothing new."""
+    members = [
+        {**{k: v for k, v in m.items() if k not in ("seen", "socket")}, "online": is_online(m, now)}
+        for m in team["members"]
+    ]
+    return {**json.loads(encode(team)), "members": members}
+
+
 def with_team(team_id: str, change: Callable[[dict], dict]) -> dict:
     """Runs `change` holding the team's row lock, so two instances can't overwrite
-    each other. The row is written back only if something actually changed."""
-    global conn
+    each other. Phones are told only when something they can see has changed."""
     for attempt in (1, 2):
         try:
             db = connection()
             with db.transaction():
+                # A frozen instance would hold this row's lock for good and hang the table.
+                db.execute(
+                    "SELECT set_config('idle_in_transaction_session_timeout', %s, true),"
+                    " set_config('lock_timeout', %s, true)",
+                    (str(FROZEN_TRANSACTION_MS), str(LOCK_WAIT_MS)),
+                )
                 row = db.execute(
                     "SELECT data FROM teams WHERE id = %s AND updated_at >= %s FOR UPDATE",
                     (team_id, time.time() - TEAM_EXPIRES_SECS),
@@ -94,18 +121,22 @@ def with_team(team_id: str, change: Callable[[dict], dict]) -> dict:
                 if team["hand"]:
                     team["hand"] = Hand.from_json(team["hand"])
                 result = change(team)
+                now = time.time()
                 if all(m["gone"] for m in team["members"]):  # everyone has left, so free the code now
                     db.execute("DELETE FROM teams WHERE id = %s", (team_id,))
+                    db.execute("SELECT pg_notify('tables', %s)", (team_id,))
                 elif encode(team) != row["data"]:
-                    team["version"] += 1
-                    result["version"] = team["version"]
+                    if public(team, now) != public(json.loads(row["data"]), now):
+                        team["version"] += 1
+                        result["version"] = team["version"]
+                        db.execute("SELECT pg_notify('tables', %s)", (team_id,))
                     db.execute(
                         "UPDATE teams SET code = %s, data = %s, updated_at = %s WHERE id = %s",
                         (team["code"], encode(team), time.time(), team_id),
                     )
                 return result
-        except psycopg.OperationalError:
-            conn = None
+        except (psycopg.OperationalError, psycopg.errors.IdleInTransactionSessionTimeout):
+            local.conn = None
             if attempt == 2:
                 raise
 
@@ -121,7 +152,7 @@ def member(team: dict, gid: str) -> Optional[dict]:
 
 
 def is_online(m: dict, now: float) -> bool:
-    return now - m["seen"] < OFFLINE_AFTER_SECS
+    return bool(m.get("socket")) and now - m["seen"] < OFFLINE_AFTER_SECS
 
 
 def new_code() -> str:
@@ -139,7 +170,7 @@ def add_member(team: dict, guest: dict) -> None:
         "id": guest["id"], "name": guest["name"],
         "seat": min(set(range(MAX_SEATS)) - taken),
         "stack": team["settings"]["stack"],
-        "sittingOut": False, "timeouts": 0, "gone": False, "seen": time.time(),
+        "sittingOut": False, "timeouts": 0, "gone": False, "seen": time.time(), "socket": None,
     })
 
 
@@ -202,14 +233,14 @@ def ensure_host(team: dict, now: float) -> None:
 
 
 def advance(team: dict, now: float) -> None:
-    """Everything a background loop would do, run on demand. Time only has to move
-    while someone is polling, and an empty table has nothing to do."""
+    """Everything that happens because time passed. Runs on every message and when a
+    timer is due, so time only moves while a phone is connected."""
     ensure_host(team, now)
     for m in list(team["members"]):
         if now - m["seen"] > SEAT_HELD_SECS:
             remove_member(team, m["id"])
 
-    for _ in range(MAX_MOVES_PER_REQUEST):
+    for _ in range(MAX_MOVES_PER_ADVANCE):
         if team["paused"]:
             return
         h = live_hand(team)
@@ -340,13 +371,13 @@ def view_for(team: dict, gid: str, now: float) -> dict:
     }
 
 
-# --- HTTP --------------------------------------------------------------------
+# --- HTTPS -------------------------------------------------------------------
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 
 def rate_limit(request: Request, limit: int = 20) -> None:
-    """Kept in Postgres because serverless instances share no memory."""
+    """Kept in Postgres because instances share no memory."""
     ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or request.client.host
     count = query(
         "INSERT INTO hits VALUES (%s, %s, 1) "
@@ -393,17 +424,13 @@ def seated(team: dict, gid: str) -> dict:
     return m
 
 
-def table_response(team: dict, gid: str, now: float, error: str = "") -> dict:
-    return {"view": view_for(team, gid, now), "version": team["version"], "error": error}
-
-
 @app.get("/health")
-async def health():
+def health():
     return {"ok": True}
 
 
 @app.post("/guests")
-async def create_guest(profile: Profile, request: Request):
+def create_guest(profile: Profile, request: Request):
     rate_limit(request)
     gid, token = str(uuid.uuid4()), secrets.token_urlsafe(32)
     query("INSERT INTO guests VALUES (%s, %s, %s)", (gid, hash_token(token), profile.name))
@@ -411,17 +438,17 @@ async def create_guest(profile: Profile, request: Request):
 
 
 @app.put("/me")
-async def update_me(profile: Profile, authorization: Optional[str] = Header(None)):
+def update_me(profile: Profile, authorization: Optional[str] = Header(None)):
     guest = current_guest(authorization)
     query("UPDATE guests SET name = %s WHERE id = %s", (profile.name, guest["id"]))
-    return {"ok": True}  # tables pick up the new name on the player's next poll
+    return {"ok": True}  # a table picks up the new name when the player next connects
 
 
 @app.delete("/me")
-async def delete_me(authorization: Optional[str] = Header(None)):
+def delete_me(authorization: Optional[str] = Header(None)):
     guest = current_guest(authorization)
     query("DELETE FROM guests WHERE id = %s", (guest["id"],))
-    return {"ok": True}  # with no more polls, their seat is released after SEAT_HELD_SECS
+    return {"ok": True}  # with no more pings, their seat is released after SEAT_HELD_SECS
 
 
 def sweep() -> None:
@@ -431,7 +458,7 @@ def sweep() -> None:
 
 
 @app.post("/teams")
-async def create_team(request: Request, authorization: Optional[str] = Header(None)):
+def create_team(request: Request, authorization: Optional[str] = Header(None)):
     rate_limit(request)
     guest = current_guest(authorization)
     sweep()
@@ -451,7 +478,7 @@ async def create_team(request: Request, authorization: Optional[str] = Header(No
 
 
 @app.post("/teams/join")
-async def join_team(body: Join, request: Request, authorization: Optional[str] = Header(None)):
+def join_team(body: Join, request: Request, authorization: Optional[str] = Header(None)):
     rate_limit(request)
     guest = current_guest(authorization)
     sweep()
@@ -474,42 +501,228 @@ async def join_team(body: Join, request: Request, authorization: Optional[str] =
     return with_team(row["id"], change)
 
 
-@app.get("/teams/{team_id}")
-async def poll_table(team_id: str, authorization: Optional[str] = Header(None)):
-    """Phones call this about once a second."""
-    guest = current_guest(authorization)
+# --- WebSocket ---------------------------------------------------------------
 
-    def change(team: dict) -> dict:
-        now = time.time()
-        m = seated(team, guest["id"])
-        m["name"] = guest["name"]
-        if now - m["seen"] > SEEN_WRITE_SECS:
-            m["seen"] = now
+rooms: dict[str, dict[str, tuple[WebSocket, str]]] = {}  # team id -> socket id -> (socket, guest id)
+timers: dict[str, float] = {}  # team id -> when its turn timer or next deal is due
+running: set[asyncio.Task] = set()
+background: list[asyncio.Task] = []
+
+
+def spawn(work) -> None:
+    task = asyncio.create_task(work)
+    running.add(task)  # asyncio only keeps a weak reference to a running task
+    task.add_done_callback(running.discard)
+
+
+def table_response(team: dict, gid: str, now: float, error: str = "") -> dict:
+    return {"view": view_for(team, gid, now), "version": team["version"], "error": error}
+
+
+def read_team(team_id: str) -> Optional[dict]:
+    row = query("SELECT data FROM teams WHERE id = %s", (team_id,)).fetchone()
+    if not row:
+        return None
+    team = json.loads(row["data"])
+    if team["hand"]:
+        team["hand"] = Hand.from_json(team["hand"])
+    return team
+
+
+def next_timer(team: dict) -> Optional[float]:
+    if team["paused"]:
+        return None
+    if live_hand(team):
+        return team["deadline"]
+    return team["nextHandAt"] if team["running"] else None
+
+
+def arrive(team: dict, guest: dict, sid: str) -> dict:
+    now = time.time()
+    seated(team, guest["id"]).update(name=guest["name"], seen=now, socket=sid)
+    advance(team, now)
+    seated(team, guest["id"])
+    return {}
+
+
+def heartbeat(team: dict, gid: str) -> dict:
+    now = time.time()
+    seated(team, gid)["seen"] = now
+    advance(team, now)
+    seated(team, gid)
+    return table_response(team, gid, now)
+
+
+def move(team: dict, gid: str, msg: Msg) -> dict:
+    now = time.time()
+    seated(team, gid)["seen"] = now
+    advance(team, now)
+    error = ""
+    try:
+        seated(team, gid)
+        handle(team, gid, msg)
         advance(team, now)
-        seated(team, guest["id"])
-        return table_response(team, guest["id"], now)
+    except IllegalAction as e:
+        error = str(e)[:100]
+    m = member(team, gid)
+    if not m or m["gone"]:
+        return {"left": True}
+    return table_response(team, gid, now, error)
 
-    return with_team(team_id, change)
+
+def depart(team: dict, gid: str, sid: str) -> dict:
+    """A phone swapping to a fresh socket has already moved on, so this does nothing then."""
+    m = member(team, gid)
+    if m and m.get("socket") == sid:
+        m["socket"] = None
+    return {}
 
 
-@app.post("/teams/{team_id}/actions")
-async def send_action(team_id: str, msg: Msg, authorization: Optional[str] = Header(None)):
-    guest = current_guest(authorization)
+def tick(team: dict) -> dict:
+    advance(team, time.time())
+    return {}
 
-    def change(team: dict) -> dict:
-        now = time.time()
-        seated(team, guest["id"])["seen"] = now
-        advance(team, now)
-        error = ""
+
+async def run_timer(team_id: str) -> None:
+    try:
+        await asyncio.to_thread(with_team, team_id, tick)
+    except HTTPException:
+        timers.pop(team_id, None)
+    except psycopg.Error:
+        pass  # the timer stays due, so the next look tries again
+
+
+async def deliver(sock: WebSocket, data: dict) -> None:
+    await asyncio.wait_for(sock.send_json(data), SEND_TIMEOUT_SECS)
+
+
+async def hang_up(sock: WebSocket, code: int) -> None:
+    try:
+        await asyncio.wait_for(sock.close(code), SEND_TIMEOUT_SECS)
+    except (RuntimeError, asyncio.TimeoutError):
+        pass  # already closed
+
+
+async def push(team_id: str) -> None:
+    """Sends each phone on this instance its own view of the table."""
+    team = await asyncio.to_thread(read_team, team_id)
+    room = dict(rooms.get(team_id, {}))
+    if team is None:
+        timers.pop(team_id, None)
+        await asyncio.gather(*(hang_up(sock, 4004) for sock, _ in room.values()))
+        return
+    now = time.time()
+    at = next_timer(team)
+    if at is None:
+        timers.pop(team_id, None)
+    else:
+        timers[team_id] = at
+
+    async def send_one(sock: WebSocket, gid: str) -> None:
+        m = member(team, gid)
         try:
-            seated(team, guest["id"])
-            handle(team, guest["id"], msg)
-            advance(team, now)
-        except IllegalAction as e:
-            error = str(e)[:100]
-        m = member(team, guest["id"])
-        if not m or m["gone"]:
-            return {"left": True, "version": team["version"], "error": ""}
-        return table_response(team, guest["id"], now, error)
+            if m and not m["gone"]:
+                await deliver(sock, table_response(team, gid, now))
+            else:
+                await hang_up(sock, 4003)
+        except (RuntimeError, asyncio.TimeoutError):
+            await hang_up(sock, 1011)  # a stuck phone mustn't hold up the rest of the table
 
-    return with_team(team_id, change)
+    await asyncio.gather(*(send_one(sock, gid) for sock, gid in room.values()))
+
+
+async def listen() -> None:
+    """One listener per instance. LISTEN needs a lasting session, which Neon's pooled
+    URL can't hold, so this one connection goes direct. A notification missed during a
+    reconnect only costs a few seconds, because each ping is answered with the table."""
+    url = os.environ["DATABASE_URL"].replace("-pooler", "", 1)
+    while True:
+        try:
+            async with await psycopg.AsyncConnection.connect(url, autocommit=True, connect_timeout=10) as db:
+                await db.execute("LISTEN tables")
+                async for note in db.notifies():
+                    if note.payload in rooms:
+                        spawn(push(note.payload))
+        except psycopg.OperationalError:
+            await asyncio.sleep(1)
+
+
+async def clock() -> None:
+    """Turn timers and the next deal have to fire even when no phone sends anything.
+    Every instance at a table does this, and the row lock lets only one of them win."""
+    while True:
+        await asyncio.sleep(CLOCK_SECS)
+        now = time.time()
+        for team_id, at in list(timers.items()):
+            if now >= at:
+                timers[team_id] = now + RETRY_TIMER_SECS  # push replaces this if anything moved
+                spawn(run_timer(team_id))
+
+
+def open_socket(team_id: str, sid: str, sock: WebSocket, gid: str) -> None:
+    rooms.setdefault(team_id, {})[sid] = (sock, gid)
+    if not background:
+        background.extend((asyncio.create_task(listen()), asyncio.create_task(clock())))
+
+
+def close_socket(team_id: str, sid: str) -> None:
+    room = rooms.get(team_id, {})
+    room.pop(sid, None)
+    if not room:
+        rooms.pop(team_id, None)
+        timers.pop(team_id, None)
+    if not rooms:
+        for task in background:
+            task.cancel()
+        background.clear()
+
+
+CLOSE_CODES = {401: 4001, 403: 4003, 404: 4004}
+
+
+@app.websocket("/ws/{team_id}")
+async def table_socket(sock: WebSocket, team_id: str):
+    """The token comes in the first message, because URLs end up in logs."""
+    await sock.accept()
+    sid = uuid.uuid4().hex
+    gid = None
+    try:
+        hello = await asyncio.wait_for(sock.receive_json(), HELLO_TIMEOUT_SECS)
+        guest = await asyncio.to_thread(current_guest, f"Bearer {hello['token']}")
+        await asyncio.to_thread(with_team, team_id, lambda team: arrive(team, guest, sid))
+        gid = guest["id"]
+        open_socket(team_id, sid, sock, gid)
+        await push(team_id)
+
+        minute, count = 0, 0
+        while True:
+            data = await asyncio.wait_for(sock.receive_json(), SILENT_SOCKET_SECS)
+            this_minute = int(time.time() // 60)
+            minute, count = this_minute, count + 1 if this_minute == minute else 1
+            if count > MESSAGES_PER_MINUTE:
+                await hang_up(sock, 4029)
+                return
+            msg = Msg.model_validate(data)
+            if msg.t == "ping":
+                reply = await asyncio.to_thread(with_team, team_id, lambda team: heartbeat(team, gid))
+            else:
+                reply = await asyncio.to_thread(with_team, team_id, lambda team: move(team, gid, msg))
+            if reply.get("left"):
+                await hang_up(sock, 1000)
+                return
+            await deliver(sock, reply)
+    except HTTPException as e:
+        await hang_up(sock, CLOSE_CODES.get(e.status_code, 1011))
+    except (ValueError, KeyError, TypeError):  # malformed message
+        await hang_up(sock, 4400)
+    except (WebSocketDisconnect, RuntimeError):
+        pass  # the phone went away
+    except asyncio.TimeoutError:
+        await hang_up(sock, 4008)
+    finally:
+        close_socket(team_id, sid)
+        if gid:
+            try:
+                await asyncio.to_thread(with_team, team_id, lambda team: depart(team, gid, sid))
+            except (HTTPException, psycopg.Error):
+                pass  # the table is gone, or the next ping sorts it out
