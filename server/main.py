@@ -21,6 +21,7 @@ from typing import Callable, Optional
 
 import psycopg
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 from psycopg.rows import dict_row
 from pydantic import BaseModel, constr
 
@@ -180,7 +181,7 @@ def live_hand(team: dict) -> Optional[Hand]:
 
 
 def remove_member(team: dict, gid: str) -> None:
-    """A player in a live hand stays until it ends; advance() folds them on their turn."""
+    """A player in a live hand keeps their seat until it ends; advance() folds them on their turn."""
     m = member(team, gid)
     if not m:
         return
@@ -200,10 +201,15 @@ def deal(team: dict, now: float) -> bool:
         return False
     button_seat = next((m["seat"] for m in ready if m["seat"] > team["buttonSeat"]), ready[0]["seat"])
     button = next(i for i, m in enumerate(ready) if m["seat"] == button_seat)
+    n = len(ready)
+    if n == 2 and ready[(button + 1) % 2]["id"] == team.get("bigBlind"):
+        button = (button + 1) % 2  # going heads-up: nobody posts the big blind twice running
+        button_seat = ready[button]["seat"]
     bb = team["settings"]["bb"]
     deck = list(DECK)
     secrets.SystemRandom().shuffle(deck)
     team["buttonSeat"] = button_seat
+    team["bigBlind"] = ready[(button + (1 if n == 2 else 2)) % n]["id"]
     team["hand"] = Hand([(m["id"], m["stack"]) for m in ready], button, max(bb // 2, 1), bb, deck)
     after_action(team)
     return True
@@ -253,7 +259,8 @@ def advance(team: dict, now: float) -> None:
             if not away:
                 m["timeouts"] += 1
                 m["sittingOut"] = m["timeouts"] >= TIMEOUTS_BEFORE_SIT_OUT
-            h.act(p["id"], "fold" if h.legal()["call"] else "check")
+            left = not m or m["gone"]  # someone who left the table can't play on and win
+            h.act(p["id"], "fold" if left or h.legal()["call"] else "check")
             after_action(team)
         elif team["running"] and now >= team["nextHandAt"]:
             if not deal(team, now):
@@ -726,3 +733,9 @@ async def table_socket(sock: WebSocket, team_id: str):
                 await asyncio.to_thread(with_team, team_id, lambda team: depart(team, gid, sid))
             except (HTTPException, psycopg.Error):
                 pass  # the table is gone, or the next ping sorts it out
+
+
+# --- website -----------------------------------------------------------------
+
+# Last, so it only gets the paths nothing above claimed.
+app.mount("/", StaticFiles(directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "web"), html=True))

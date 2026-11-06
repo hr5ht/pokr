@@ -2,7 +2,7 @@
 
 Private Texas Hold'em for friends. Open the app, pick a name, and share a 4-digit code. There are no accounts or real money.
 
-Download the Android app from [Releases](../../releases/latest).
+Play in any browser at https://pokr-wine.vercel.app, on a phone or a computer.
 
 ## Features
 
@@ -24,11 +24,12 @@ A table is deleted as soon as everyone has left, or after 4 hours with no connec
 
 | Part | Stack |
 | --- | --- |
+| `server/web/` | The website: plain HTML, CSS and JavaScript |
 | `app/` | Expo SDK 58, React Native, TypeScript |
 | `server/` | FastAPI, psycopg, Postgres |
 | Hosting | Vercel (Singapore) and Neon |
 
-The poker rules are in `server/engine.py`, and the API is in `server/main.py`.
+The poker rules are in `server/engine.py`, and the API is in `server/main.py`, which also serves the website.
 
 ## Run locally
 

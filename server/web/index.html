@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0F5A43">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' ws: wss:; style-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+  <title>Pokr</title>
+  <meta name="description" content="Private poker with friends">
+  <link rel="icon" type="image/png" href="/logo.png">
+  <link rel="preload" href="/fonts/BricolageGrotesque_800ExtraBold.ttf" as="font" type="font/ttf" crossorigin>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main id="app"></main>
+  <div id="scrim" data-do="dismissSheet"></div>
+  <section id="sheet" role="dialog" aria-modal="true" aria-label="Menu">
+    <div id="handle" aria-hidden="true"><i></i></div>
+    <div id="sheet-body"></div>
+  </section>
+  <script src="/app.js"></script>
+</body>
+</html>

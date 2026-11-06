@@ -16,6 +16,10 @@ class IllegalAction(ValueError):
     pass
 
 
+def hand_name(score: tuple) -> str:
+    return "Royal Flush" if score == (8, 12) else HAND_NAMES[score[0]]
+
+
 def score5(cards: list[str]) -> tuple:
     """Comparable score for exactly five cards; higher wins."""
     ranks = sorted((RANKS.index(c[0]) for c in cards), reverse=True)
@@ -96,8 +100,10 @@ class Hand:
         p = self.players[self.to_act]
         all_in_to = p["bet"] + p["stack"]
         others_can_respond = any(self._can_act(o) for o in self.players if o is not p)
-        # `acted` stays True after a short all-in, so that doesn't reopen raising.
-        can_raise = all_in_to > self.current and not p["acted"] and others_can_respond
+        # A player who already acted can raise again only when facing a full raise,
+        # which several short all-ins can add up to (TDA Rule 47).
+        reopened = self.current - p["bet"] >= self.min_raise
+        can_raise = all_in_to > self.current and (not p["acted"] or reopened) and others_can_respond
         return {
             "call": min(self.current - p["bet"], p["stack"]),
             "raiseMin": min(self.current + self.min_raise, all_in_to) if can_raise else None,
@@ -128,7 +134,7 @@ class Hand:
             word = "Raise" if self.current else "Bet"
             self._pay(p, amount - p["bet"])
             self.current = amount
-            # short all-ins that add up to a full raise don't reopen betting.
+            # A short all-in doesn't set a new minimum raise or restart the action.
             if raised_by >= self.min_raise:
                 self.min_raise = raised_by
                 for other in self.players:
@@ -152,7 +158,7 @@ class Hand:
         p = next(o for o in self.players if o["id"] == pid)
         if len(self.board) < 3 or p["folded"]:
             return None
-        return HAND_NAMES[best5(p["cards"] + self.board)[0][0]]
+        return hand_name(best5(p["cards"] + self.board)[0])
 
     def _can_act(self, p: dict) -> bool:
         return not p["folded"] and not p["allin"]
@@ -168,8 +174,10 @@ class Hand:
         """Next seat after i that still has a decision, or None if the street is over."""
         n = len(self.players)
         actors = [p for p in self.players if self._can_act(p)]
-        if len(actors) == 1 and actors[0]["bet"] >= self.current:
-            return None  # the last player able to act has nobody to bet against
+        if len(actors) == 1:
+            rivals = [o["bet"] for o in self.players if not o["folded"] and o is not actors[0]]
+            if actors[0]["bet"] >= max(rivals):
+                return None  # already covers everyone left, even a big blind posted short
         for k in range(1, n + 1):
             j = (i + k) % n
             p = self.players[j]
@@ -194,11 +202,13 @@ class Hand:
             return
         self._showdown()
 
-    def _refund_uncalled(self) -> None:
+    def _refund_uncalled(self) -> dict | None:
         top = max(self.players, key=lambda p: p["total"])
         second = max(p["total"] for p in self.players if p is not top)
-        top["stack"] += top["total"] - second
+        back = top["total"] - second
+        top["stack"] += back
         top["total"] = second
+        return {"id": top["id"], "amount": back} if back else None
 
     def _finish_by_fold(self) -> None:
         self._refund_uncalled()
@@ -216,7 +226,7 @@ class Hand:
         return pots
 
     def _showdown(self) -> None:
-        self._refund_uncalled()
+        returned = self._refund_uncalled()
         live = [p for p in self.players if not p["folded"]]
         scored = {p["id"]: best5(p["cards"] + self.board) for p in live}
         seats_from_button = [
@@ -237,11 +247,12 @@ class Hand:
         self._settle(
             wins,
             shown=[p["id"] for p in live],
-            names={pid: HAND_NAMES[s[0][0]] for pid, s in scored.items()},
+            names={pid: hand_name(s[0]) for pid, s in scored.items()},
             fives={pid: s[1] for pid, s in scored.items()},
+            returned=returned,
         )
 
-    def _settle(self, wins: dict, shown: list[str], names: dict, fives: dict) -> None:
+    def _settle(self, wins: dict, shown: list[str], names: dict, fives: dict, returned: dict | None = None) -> None:
         winners = []
         for p in self.players:
             won = wins.get(p["id"], 0)
@@ -255,4 +266,6 @@ class Hand:
                     "cards": fives.get(p["id"], []),
                 })
         self.to_act = None
-        self.result = {"winners": winners, "shown": shown, "names": names, "pot": sum(wins.values())}
+        self.result = {
+            "winners": winners, "shown": shown, "names": names, "pot": sum(wins.values()), "returned": returned,
+        }
