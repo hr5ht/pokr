@@ -1,5 +1,8 @@
-"""Game API. Guest profiles and team codes are plain HTTPS; the table runs over a
+"""Game API. Creating and joining a team are plain HTTPS; the table runs over a
 WebSocket at /ws/{team_id}.
+
+There are no accounts. A player is a random secret their browser keeps, and their id
+is its hash. Their name is stored only in the table's row, so it goes when the table does.
 
 Vercel may run several instances and closes every socket after five minutes, so
 nothing that matters lives in memory. The table is in Postgres, NOTIFY tells every
@@ -65,7 +68,7 @@ def connection() -> psycopg.Connection:
             prepare_threshold=None,
         )
     if not tables_ready:
-        db.execute("CREATE TABLE IF NOT EXISTS guests(id TEXT PRIMARY KEY, token_hash TEXT UNIQUE, name TEXT)")
+        db.execute("DROP TABLE IF EXISTS guests")  # profiles are no longer stored
         db.execute(
             "CREATE TABLE IF NOT EXISTS teams"
             "(id TEXT PRIMARY KEY, code TEXT UNIQUE, data TEXT, updated_at DOUBLE PRECISION)"
@@ -389,18 +392,17 @@ def rate_limit(request: Request, limit: int = 20) -> None:
     count = query(
         "INSERT INTO hits VALUES (%s, %s, 1) "
         "ON CONFLICT (key, minute) DO UPDATE SET count = hits.count + 1 RETURNING count",
-        (f"{ip}:{request.url.path}", int(time.time() // 60)),
+        (hash_token(f"{ip}:{request.url.path}"), int(time.time() // 60)),
     ).fetchone()["count"]
     if count > limit:
         raise HTTPException(429, "Too many attempts. Try again in a minute.")
 
 
-def current_guest(authorization: Optional[str]) -> dict:
+def current_guest(authorization: Optional[str], name: str) -> dict:
     token = (authorization or "").replace("Bearer ", "", 1)
-    guest = query("SELECT * FROM guests WHERE token_hash = %s", (hash_token(token),)).fetchone() if token else None
-    if not guest:
+    if not 32 <= len(token) <= 128:
         raise HTTPException(401, "Unknown guest")
-    return guest
+    return {"id": hash_token(token), "name": name}
 
 
 Name = constr(strip_whitespace=True, min_length=1, max_length=16)
@@ -410,7 +412,7 @@ class Profile(BaseModel):
     name: Name
 
 
-class Join(BaseModel):
+class Join(Profile):
     code: constr(strip_whitespace=True, pattern=r"^[0-9]{4}$")
 
 
@@ -436,28 +438,6 @@ def health():
     return {"ok": True}
 
 
-@app.post("/guests")
-def create_guest(profile: Profile, request: Request):
-    rate_limit(request)
-    gid, token = str(uuid.uuid4()), secrets.token_urlsafe(32)
-    query("INSERT INTO guests VALUES (%s, %s, %s)", (gid, hash_token(token), profile.name))
-    return {"id": gid, "token": token}
-
-
-@app.put("/me")
-def update_me(profile: Profile, authorization: Optional[str] = Header(None)):
-    guest = current_guest(authorization)
-    query("UPDATE guests SET name = %s WHERE id = %s", (profile.name, guest["id"]))
-    return {"ok": True}  # a table picks up the new name when the player next connects
-
-
-@app.delete("/me")
-def delete_me(authorization: Optional[str] = Header(None)):
-    guest = current_guest(authorization)
-    query("DELETE FROM guests WHERE id = %s", (guest["id"],))
-    return {"ok": True}  # with no more pings, their seat is released after SEAT_HELD_SECS
-
-
 def sweep() -> None:
     """Nothing runs in the background, so the requests that need a free code clean up."""
     query("DELETE FROM teams WHERE updated_at < %s", (time.time() - TEAM_EXPIRES_SECS,))
@@ -465,9 +445,9 @@ def sweep() -> None:
 
 
 @app.post("/teams")
-def create_team(request: Request, authorization: Optional[str] = Header(None)):
+def create_team(profile: Profile, request: Request, authorization: Optional[str] = Header(None)):
     rate_limit(request)
-    guest = current_guest(authorization)
+    guest = current_guest(authorization, profile.name)
     sweep()
     try:
         code = new_code()
@@ -487,7 +467,7 @@ def create_team(request: Request, authorization: Optional[str] = Header(None)):
 @app.post("/teams/join")
 def join_team(body: Join, request: Request, authorization: Optional[str] = Header(None)):
     rate_limit(request)
-    guest = current_guest(authorization)
+    guest = current_guest(authorization, body.name)
     sweep()
     row = query("SELECT id FROM teams WHERE code = %s", (body.code,)).fetchone()
     if not row:
@@ -498,7 +478,7 @@ def join_team(body: Join, request: Request, authorization: Optional[str] = Heade
             raise HTTPException(403, "The host removed you from this team")
         existing = member(team, guest["id"])
         if existing:
-            existing.update(gone=False, seen=time.time())
+            existing.update(name=guest["name"], gone=False, seen=time.time())
         else:
             if len(team["members"]) >= MAX_SEATS:
                 raise HTTPException(409, "This table is full")
@@ -695,7 +675,7 @@ async def table_socket(sock: WebSocket, team_id: str):
     gid = None
     try:
         hello = await asyncio.wait_for(sock.receive_json(), HELLO_TIMEOUT_SECS)
-        guest = await asyncio.to_thread(current_guest, f"Bearer {hello['token']}")
+        guest = current_guest(f"Bearer {hello['token']}", Profile(name=hello.get("name")).name)
         await asyncio.to_thread(with_team, team_id, lambda team: arrive(team, guest, sid))
         gid = guest["id"]
         open_socket(team_id, sid, sock, gid)

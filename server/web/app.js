@@ -13,6 +13,7 @@ const SHOWDOWN_PAUSE_MS = 7000;
 const REQUEST_TIMEOUT_MS = 15000;
 const SHEET_CLOSE_MS = 300;
 const DRAG_TO_CLOSE = 110;
+const BAD_MESSAGE = 4400;
 const NOT_AT_TABLE = new Set([4001, 4003, 4004]);
 
 const NAMES = ['Lucky Duck', 'River Rat', 'Big Blind', 'Card Shark', 'Pocket Rocket', 'Slow Roll', 'Fish Taco', 'Ace Ventura'];
@@ -232,7 +233,7 @@ async function enter(open) {
   Object.assign(home, { busy: true, error: '' });
   renderHome();
   try {
-    const team = await open(home.profile.token);
+    const team = await open(home.profile);
     home.recent = [team, ...home.recent.filter((t) => t.teamId !== team.teamId)].slice(0, 5);
     write(RECENT_KEY, home.recent);
     home.code = '';
@@ -247,27 +248,18 @@ async function enter(open) {
   }
 }
 
-const joinTeam = (code) => enter((token) => request('/teams/join', 'POST', token, { code }));
+const joinTeam = (code) => enter(({ token, name }) => request('/teams/join', 'POST', token, { code, name }));
 
-async function saveProfile() {
+// The server keeps no profiles: this secret is what proves a seat is yours.
+const newToken = () => Array.from(crypto.getRandomValues(new Uint8Array(32)), (b) => b.toString(16).padStart(2, '0')).join('');
+
+function saveProfile() {
   const name = home.name.trim();
-  if (home.busy || !name) return;
-  Object.assign(home, { busy: true, error: '' });
-  renderProfile();
-  try {
-    if (home.profile) {
-      await request('/me', 'PUT', home.profile.token, { name });
-      home.profile = { ...home.profile, name };
-    } else {
-      home.profile = { ...(await request('/guests', 'POST', undefined, { name })), name };
-    }
-    write(PROFILE_KEY, home.profile);
-    Object.assign(home, { editing: false, name: '', busy: false });
-    renderHome();
-  } catch (e) {
-    Object.assign(home, { error: e.message, busy: false });
-    renderProfile();
-  }
+  if (!name) return;
+  home.profile = { token: home.profile?.token ?? newToken(), name };
+  write(PROFILE_KEY, home.profile);
+  Object.assign(home, { editing: false, name: '', error: '' });
+  renderHome();
 }
 
 // --- table connection --------------------------------------------------------
@@ -276,7 +268,7 @@ const ui = { raising: false, sent: false, amount: 0, peek: false, turnKey: '', t
 let table = null;
 
 /** Every message from the server is the whole table, so reconnecting needs no catching up. */
-function openTable(teamId, token) {
+function openTable(teamId, { token, name }) {
   table = { teamId, view: null, version: 0, connected: true, removed: false, error: '', sock: null, mode: '' };
   const current = table;
   let stopped = false;
@@ -295,7 +287,7 @@ function openTable(teamId, token) {
     startedAt = Date.now();
     stale?.close();
 
-    ws.onopen = () => ws.send(JSON.stringify({ token }));
+    ws.onopen = () => ws.send(JSON.stringify({ token, name }));
     ws.onmessage = (event) => {
       if (ws === pending) {
         const old = current.sock;
@@ -318,6 +310,10 @@ function openTable(teamId, token) {
     };
     ws.onclose = (event) => {
       if (stopped) return;
+      if (event.code === BAD_MESSAGE) { // this page is older than the server, and retrying won't help
+        location.reload();
+        return;
+      }
       if (NOT_AT_TABLE.has(event.code)) {
         current.removed = true;
         renderTable();
@@ -872,7 +868,7 @@ function exitTable() {
 }
 
 const actions = {
-  createTeam: () => enter((token) => request('/teams', 'POST', token)).catch(() => {}),
+  createTeam: () => enter(({ token, name }) => request('/teams', 'POST', token, { name })).catch(() => {}),
   joinCode: () => joinTeam(home.code).catch(() => {}),
   async openRecent(code) {
     try {
@@ -900,15 +896,7 @@ const actions = {
     renderHome();
   },
   askReset: () => openSheet('reset'),
-  async confirmReset() {
-    home.busy = true;
-    renderSheet();
-    try {
-      await request('/me', 'DELETE', home.profile.token);
-    } catch {
-      // Already gone or offline: this browser forgets it either way.
-    }
-    home.busy = false;
+  confirmReset() {
     clearLocal();
     renderHome();
   },
@@ -1030,7 +1018,7 @@ function route() {
   Object.assign(ui, { raising: false, sent: false, peek: false, turnKey: '', resultKey: '' });
   closeSheet();
   const teamId = location.hash.slice(1);
-  if (teamId && home.profile) openTable(teamId, home.profile.token);
+  if (teamId && home.profile) openTable(teamId, home.profile);
   else renderHome();
 }
 

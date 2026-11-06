@@ -6,7 +6,7 @@ Play in any browser at https://pokr-wine.vercel.app, on a phone or a computer.
 
 ## Features
 
-- Guest profiles with no sign-up
+- No sign-up: your name stays in your browser
 - Private tables for up to 12 players, joined with a 4-digit code
 - Host controls for blinds, starting stack, turn timer, pause, kick and changing the code
 - Side pots, all-ins, rebuys and automatic folds when a turn timer runs out
@@ -16,9 +16,11 @@ Play in any browser at https://pokr-wine.vercel.app, on a phone or a computer.
 
 The server decides everything, and each phone only receives the cards its player is allowed to see.
 
-Profiles and team codes use HTTPS. The table itself runs over a WebSocket, so a move reaches the other phones as soon as the server has it.
+Creating and joining a team use HTTPS. The table itself runs over a WebSocket, so a move reaches the other phones as soon as the server has it.
 
 Vercel can run several instances and closes each socket after five minutes, so no game state lives in memory. Every table is a row in Postgres, a row lock stops two instances from overwriting each other, and `NOTIFY` tells every instance when a table changes. Each instance then sends the new table to the phones connected to it. The app swaps to a fresh socket before the five minutes are up and reconnects if replies stop arriving.
+
+The database holds tables, not people. There are no accounts: your browser keeps a random secret, and your player ID is its hash. Your name is stored only in the table you're playing at, so it goes when the table does.
 
 A table is deleted as soon as everyone has left, or after 4 hours with no connected phones or moves. Its code is then free to use again.
 
@@ -43,6 +45,8 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt uvicorn
 DATABASE_URL=postgresql://... .venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 ```
+
+The Expo app in `app/` hasn't been updated since profiles were removed, so it can't create or join a team until it is.
 
 Start the app, then open it in Expo Go:
 
